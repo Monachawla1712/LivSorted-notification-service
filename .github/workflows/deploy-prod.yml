@@ -1,0 +1,72 @@
+name: Auto build and deploy on prod
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  deployment:
+    runs-on: ubuntu-latest
+    env:
+      IMAGE_NAME: notification:prod  # Docker image name
+      DOCKER_IMAGE_PATH: /home/ec2-user/docker-images/notification-prod/build.tar  # Docker save path
+      BUILD_DIR: /home/ec2-user/notification-service  # The build directory
+      BD_PROD_INSTANCE_ID: ${{ secrets.BD_PROD_INSTANCE_ID }} #BD_PROD server instance ID
+
+    steps:
+      - name: Set up AWS CLI
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-south-1
+
+      - name: Code Build
+        run: |
+          COMMAND_ID=$(aws ssm send-command --instance-ids ${{env.BD_PROD_INSTANCE_ID}} --document-name "AWS-RunShellScript" --parameters "commands=[' echo Starting Build... 2>&1 && export HOME=/home/ec2-user 2>&1 && cd ${{env.BUILD_DIR}} 2>&1 &&  git config --global --add safe.directory ${{env.BUILD_DIR}} 2>&1 && git checkout main 2>&1 && git pull 2>&1 && docker build -t sortedteam/${{env.IMAGE_NAME}} ./ 2>&1 && docker image prune -f 2>&1 && docker save -o ${{env.DOCKER_IMAGE_PATH}} sortedteam/${{env.IMAGE_NAME}} 2>&1 && docker rmi sortedteam/${{env.IMAGE_NAME}} 2>&1 && chmod 664 ${{env.DOCKER_IMAGE_PATH}} 2>&1 && echo Build Done......2>&1'], executionTimeout=['600']"  --timeout-seconds 100 --comment "Running bash commands from GitHub Actions" --query "Command.CommandId" --output text)
+          # Initialize the status variable
+          COMMAND_STATUS=$(aws ssm list-command-invocations \
+              --command-id $COMMAND_ID \
+              --instance-id ${{env.BD_PROD_INSTANCE_ID}} \
+              --query "CommandInvocations[0].Status" \
+              --output text)
+          # Loop to check the status of the command while it's still InProgress
+          while [[ "$COMMAND_STATUS" == "InProgress" ]]; do
+            echo "Command is still in progress..."
+            # Wait for a few seconds before checking again (adjust time as needed)
+            sleep 10
+            
+            # Fetch the current status of the command
+            COMMAND_STATUS=$(aws ssm list-command-invocations \
+              --command-id $COMMAND_ID \
+              --instance-id ${{env.BD_PROD_INSTANCE_ID}} \
+              --query "CommandInvocations[0].Status" \
+              --output text)
+          done
+          OUTPUT=$(aws ssm get-command-invocation \
+            --instance-id ${{env.BD_PROD_INSTANCE_ID}} \
+            --command-id $COMMAND_ID \
+            --query "StandardOutputContent" \
+            --output text)
+          echo "Build Output: $OUTPUT"    
+          if [[ "$COMMAND_STATUS" == "Failed" || "$COMMAND_STATUS" == "TimedOut" ]]; then
+            echo "Build Failed !!!!!"
+            exit 1;        
+          fi
+      # - name: Request notification-prod deployment approval
+      #   uses: trstringer/manual-approval@v1.8.0
+      #   timeout-minutes: 5
+      #   with:
+      #     approvers: ${{ secrets.APPROVERS }}
+      #     secret: ${{ github.TOKEN }}
+      #     minimum-approvals: 1
+      #     exclude-workflow-initiator-as-approver: false
+
+      - name: Code Deploy
+        run: |
+              aws deploy create-deployment \
+                --application-name Consumer-app \
+                --deployment-group-name Consumer-app-prod-notification-service \
+                --s3-location bucket=code-deploy-livsorted,key=consumer-app-service/notification-service.tar,bundleType=tar \
+                --deployment-config-name CodeDeployDefault.OneAtATime
